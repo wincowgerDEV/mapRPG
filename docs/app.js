@@ -7,12 +7,17 @@ var baseLayers = {
     attribution: '&copy; OpenStreetMap contributors'
   }),
   "Satellite": L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    attribution: 'Tiles &copy; Esri &mdash; Source: Esri'
+    attribution: 'Tiles © Esri'
   })
 };
 
 // Add default base layer
 baseLayers["OpenStreetMap"].addTo(map);
+
+// Helper to wrap longitude into the legal –180 … 180 range
+function wrapLon(lon) {
+  return ((lon + 180) % 360 + 360) % 360 - 180;
+}
 
 // Layer control for basemaps
 L.control.layers(baseLayers).addTo(map);
@@ -41,80 +46,88 @@ map.addControl(drawControl);
 
 var userPolygon;
 
+// When a polygon is created …
 map.on(L.Draw.Event.CREATED, function (e) {
   drawnItems.clearLayers();
   userPolygon = e.layer;
   drawnItems.addLayer(userPolygon);
   document.getElementById('downloadBtn').disabled = false;
 
+  // Show popup asking the user to download points
+  var centroid = turf.centroid(userPolygon.toGeoJSON()).geometry.coordinates;
+  var popupContent =
+    '<div style="text-align:center;">' +
+      '<p>Download random points in this region?</p>' +
+      '<button id="popupDownloadBtn" class="btn btn-primary btn-sm">Download</button>' +
+    '</div>';
+
+  var popup = L.popup()
+    .setLatLng([centroid[1], centroid[0]])
+    .setContent(popupContent)
+    .openOn(map);
+
+  // Attach click handler to popup button once it exists
+  setTimeout(function () {
+    var btn = document.getElementById('popupDownloadBtn');
+    if (btn) {
+      btn.addEventListener('click', function () {
+        document.getElementById('downloadBtn').click(); // trigger normal download flow
+        map.closePopup(popup);
+      });
+    }
+  }, 0);
+
   // Clear existing point markers
   pointMarkers.clearLayers();
 });
 
+// Random-point generator
 function generateRandomPoints(polygon, numPoints) {
   var points = [];
-  var maxIterations = 10; // Adjust as necessary
+  var maxIterations = 10;
   var iterations = 0;
 
   var bbox = turf.bbox(polygon);
-
   var minX = bbox[0];
   var minY = bbox[1];
   var maxX = bbox[2];
   var maxY = bbox[3];
 
   var longitudesCrossAntimeridian = minX > maxX;
-
-  if (longitudesCrossAntimeridian) {
-    // Adjust maxX to be in the correct range
-    maxX += 360;
-  }
+  if (longitudesCrossAntimeridian) maxX += 360;
 
   while (points.length < numPoints && iterations < maxIterations) {
-    var pointsToGenerate = (numPoints - points.length) * 5; // Generate more points than needed
-    var randomPoints = {
-      "type": "FeatureCollection",
-      "features": []
-    };
+    var pointsToGenerate = (numPoints - points.length) * 5; // oversample
+    var randomPoints = { type: "FeatureCollection", features: [] };
 
     for (var i = 0; i < pointsToGenerate; i++) {
       var randX = minX + Math.random() * (maxX - minX);
-
-      // Wrap longitude back to -180 to 180 range
-      if (randX > 180) {
-        randX -= 360;
-      }
-
+      // Wrap longitude into valid range
+      randX = wrapLon(randX);
       var randY = minY + Math.random() * (maxY - minY);
 
-      var point = turf.point([randX, randY]);
-      randomPoints.features.push(point);
+      randomPoints.features.push(turf.point([randX, randY]));
     }
 
-    // Filter points within the main polygon
+    // Keep only points inside the polygon
     var ptsWithin = turf.pointsWithinPolygon(randomPoints, polygon);
-
-    ptsWithin.features.forEach(function(feature) {
-      if (points.length < numPoints) {
-        points.push(feature.geometry.coordinates);
-      }
+    ptsWithin.features.forEach(function (pt) {
+      if (points.length < numPoints) points.push(pt.geometry.coordinates);
     });
-
     iterations++;
   }
 
   if (points.length < numPoints) {
-    alert('Could not generate the desired number of points within the polygon. Please try drawing a larger polygon or reducing the number of points.');
+    alert('Could not generate the desired number of points within the selected area. Try a larger polygon or fewer points.');
   }
-
   return points;
 }
 
-// Download the points as a CSV file
+// Download the points as CSV
 function downloadCSV(points) {
   var csvContent = "point_number,latitude,longitude\n";
-  points.forEach(function(point, index) {
-    csvContent += (index + 1) + "," + point[1] + "," + point[0] + "\n";
+  points.forEach(function (point, index) {
+    csvContent += (index + 1) + "," + point[1] + "," + wrapLon(point[0]) + "\n";
   });
   var blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
   saveAs(blob, 'random_points.csv');
@@ -122,14 +135,11 @@ function downloadCSV(points) {
 
 // Plot points on the map
 function plotPointsOnMap(points) {
-  // Clear existing markers
   pointMarkers.clearLayers();
-
   var latLngs = [];
 
-  // Add new markers
-  points.forEach(function(coord) {
-    var marker = L.circleMarker([coord[1], coord[0]], {
+  points.forEach(function (coord) {
+    var marker = L.circleMarker([coord[1], wrapLon(coord[0])], {
       radius: 5,
       fillColor: '#ff7800',
       color: '#000',
@@ -138,31 +148,25 @@ function plotPointsOnMap(points) {
       fillOpacity: 0.8
     });
     pointMarkers.addLayer(marker);
-    latLngs.push([coord[1], coord[0]]);
+    latLngs.push([coord[1], wrapLon(coord[0])]);
   });
 
-  // Adjust map view to fit the points
-  if (latLngs.length > 0) {
-    var bounds = L.latLngBounds(latLngs);
-    map.fitBounds(bounds);
-  }
+  if (latLngs.length) map.fitBounds(L.latLngBounds(latLngs));
 }
 
-// Instructions Modal Functionality
-var instructionsModal = new bootstrap.Modal(document.getElementById('instructionsModal'), {});
-var instructionsBtn = document.getElementById('instructionsBtn');
-
-instructionsBtn.addEventListener('click', function() {
+// Instructions modal
+var instructionsModal = new bootstrap.Modal(document.getElementById('instructionsModal'));
+document.getElementById('instructionsBtn').addEventListener('click', function () {
   instructionsModal.show();
 });
 
-// Report Issue Button Functionality
-document.getElementById('reportIssueBtn').addEventListener('click', function() {
+// Report Issue button
+document.getElementById('reportIssueBtn').addEventListener('click', function () {
   window.open('https://github.com/wincowgerDEV/mapRPG/issues', '_blank');
 });
 
-// Handle the Download CSV button click
-document.getElementById('downloadBtn').addEventListener('click', function() {
+// Main “Download CSV” button
+document.getElementById('downloadBtn').addEventListener('click', function () {
   if (!userPolygon) {
     alert('Please draw a polygon first.');
     return;
@@ -177,12 +181,7 @@ document.getElementById('downloadBtn').addEventListener('click', function() {
     return;
   }
 
-  // Generate random points
   var points = generateRandomPoints(geojson.geometry, numPoints);
-
-  // Download CSV
   downloadCSV(points);
-
-  // Plot points on the map
   plotPointsOnMap(points);
 });
